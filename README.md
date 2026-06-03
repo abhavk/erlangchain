@@ -13,7 +13,7 @@ dependencies (only OTP `inets` + `ssl`).
 ```erlang
 %% rebar.config
 {deps, [
-    {erlangchain, {git, "https://github.com/you/erlangchain.git", {tag, "0.1.0"}}}
+    {erlangchain, {git, "https://github.com/abhavk/erlangchain.git", {tag, "0.1.0"}}}
 ]}.
 ```
 
