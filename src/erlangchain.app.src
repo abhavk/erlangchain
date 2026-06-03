@@ -1,0 +1,10 @@
+{application, erlangchain,
+ [{description, "Minimal LLM client (OpenAI / Anthropic) and JSON codec for Erlang"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications, [kernel, stdlib, inets, ssl]},
+  {env, []},
+  {modules, []},
+  {licenses, ["MIT"]},
+  {links, [{"GitHub", "https://github.com/you/erlangchain"}]}
+ ]}.
