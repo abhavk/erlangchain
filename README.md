@@ -1,7 +1,9 @@
 # erlangchain
 
-Minimal building blocks for talking to LLMs from Erlang, with zero third-party
+Minimal building blocks for talking to LLMs from Erlang. No third-party
 dependencies (only OTP `inets` + `ssl`).
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/abhavk/erlangchain)
 
 | Module      | Role                                                          |
 |-------------|---------------------------------------------------------------|
