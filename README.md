@@ -2,8 +2,8 @@
 
 [![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/abhavk/erlangchain)
 
-Minimal building blocks for talking to LLMs from Erlang. No third-party
-dependencies (only OTP `inets` + `ssl`).
+Minimal building blocks for talking to LLMs from Erlang, without third-party
+dependencies.
 
 | Module      | Role                                                          |
 |-------------|---------------------------------------------------------------|
