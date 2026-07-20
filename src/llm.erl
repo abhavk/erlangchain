@@ -1,5 +1,6 @@
 -module(llm).
--export([chat/1, chat/3, chat/4, chat/5, model_for/2]).
+-export([chat/1, chat/3, chat/4, chat/5, chat/6, model_for/2]).
+-export_type([datasource/0]).
 
 -define(ANTHROPIC_URL, "https://api.anthropic.com/v1/messages").
 -define(OPENAI_RESPONSES_URL, "https://api.openai.com/v1/responses").
@@ -9,8 +10,8 @@
 
 -define(ANTHROPIC_BIG,   "claude-sonnet-4-20250514").
 -define(ANTHROPIC_SMALL, "claude-haiku-3-5-20241022").
--define(OPENAI_BIG,      "gpt-5.4").
--define(OPENAI_SMALL,    "gpt-5.4-mini").
+-define(OPENAI_BIG,      "gpt-5.6-terra").
+-define(OPENAI_SMALL,    "gpt-5.6-luna").
 
 %% -------------------------------------------------------------------
 %% Public API
@@ -18,12 +19,15 @@
 %%   chat(Provider, Size, Messages)              -> {ok, Resp} | {error, _}
 %%   chat(Provider, Size, Messages, Tools)       -> {ok, Resp} | {error, _}
 %%   chat(Provider, Size, Messages, Tools, Opts) -> {ok, Resp} | {error, _}
+%%   chat(Provider, Size, Messages, Tools, Datasource, Opts)
+%%                                                -> {ok, Resp} | {error, _}
 %%
 %% Provider = anthropic | openai
 %% Size     = big | small
 %% Messages = [#{role => ..., content => ...} | #{role => user, parts => [...]} | ...]
 %% User multimodal: #{role => user, parts => [{text, _} | {image_base64, Mime, B64}]}
 %% Tools    = [#{name => binary(), description => binary(), parameters => map()}]
+%% Datasource = none | binary()  OpenAI vector store id; Anthropic does not support it.
 %% Opts     = #{model => string(), reasoning_effort => atom()}   optional overrides
 %%            reasoning_effort: OpenAI Responses API only; sent as reasoning.effort.
 %%            Default for Provider=openai, Size=big is medium; omit by overriding in Opts if needed.
@@ -41,6 +45,8 @@
 %%   #{role => tool_result, tool_use_id => Id, content => ResultBin}
 %% -------------------------------------------------------------------
 
+-type datasource() :: none | binary().
+
 chat(Messages) ->
     chat(openai, small, Messages, []).
 
@@ -50,10 +56,19 @@ chat(Provider, Size, Messages) ->
 chat(Provider, Size, Messages, Tools) ->
     chat(Provider, Size, Messages, Tools, #{}).
 
-chat(anthropic, Size, Messages, Tools, Opts) ->
+chat(Provider, Size, Messages, Tools, Opts) ->
+    chat(Provider, Size, Messages, Tools, none, Opts).
+
+-spec chat(anthropic | openai, big | small, [map()], [map()], datasource(), map()) ->
+    {ok, map()} | {error, term()}.
+chat(anthropic, Size, Messages, Tools, none, Opts) ->
     anthropic_chat(Size, Messages, Tools, Opts);
-chat(openai, Size, Messages, Tools, Opts) ->
-    openai_chat(Size, Messages, Tools, Opts).
+chat(anthropic, _Size, _Messages, _Tools, Datasource, _Opts)
+  when is_binary(Datasource) ->
+    {error, {unsupported_feature, datasource}};
+chat(openai, Size, Messages, Tools, Datasource, Opts)
+  when Datasource =:= none; is_binary(Datasource) ->
+    openai_chat(Size, Messages, Tools, Datasource, Opts).
 
 default_model(anthropic, big)   -> ?ANTHROPIC_BIG;
 default_model(anthropic, small) -> ?ANTHROPIC_SMALL;
@@ -155,7 +170,7 @@ parse_anthropic(Resp) ->
 
 %%--- OpenAI ---------------------------------------------------------
 
-openai_chat(Size, Messages, Tools, Opts) ->
+openai_chat(Size, Messages, Tools, Datasource, Opts) ->
     ensure_started(),
     Key = require_env("OPENAI_API_KEY"),
     Opts1 = case Size of
@@ -164,21 +179,23 @@ openai_chat(Size, Messages, Tools, Opts) ->
             end,
     Model = maps:get(model, Opts1, default_model(openai, Size)),
     InputItems = messages_to_responses_input(Messages),
-    Body = openai_responses_body(Model, InputItems, Tools, Opts1),
+    Body = openai_responses_body(Model, InputItems, Tools, Datasource, Opts1),
     Headers = [{"authorization", "Bearer " ++ Key}],
     case post(?OPENAI_RESPONSES_URL, Headers, Body) of
         {ok, Resp} -> {ok, parse_openai_response(Resp)};
         Err        -> Err
     end.
 
-openai_responses_body(Model, InputItems, Tools, Opts) ->
+openai_responses_body(Model, InputItems, Tools, Datasource, Opts) ->
     Base0 = #{<<"model">> => to_bin(Model),
               <<"input">> => InputItems,
               <<"max_output_tokens">> => ?MAX_TOKENS},
-    Base1 = case Tools of
+    RequestTools = [openai_responses_tool(T) || T <- Tools]
+                   ++ openai_datasource_tools(Datasource),
+    Base1 = case RequestTools of
                 [] -> Base0;
                 Ts ->
-                    Base0#{<<"tools">> => [openai_responses_tool(T) || T <- Ts],
+                    Base0#{<<"tools">> => Ts,
                             <<"tool_choice">> => <<"auto">>}
             end,
     Base2 = case maps:get(reasoning_effort, Opts, undefined) of
@@ -231,6 +248,12 @@ openai_responses_tool(#{name := N, description := D, parameters := P}) ->
       <<"description">> => to_bin(D),
       <<"parameters">>  => P,
       <<"strict">>      => false}.
+
+openai_datasource_tools(none) ->
+    [];
+openai_datasource_tools(VectorStoreId) when is_binary(VectorStoreId) ->
+    [#{<<"type">> => <<"file_search">>,
+       <<"vector_store_ids">> => [VectorStoreId]}].
 
 responses_input_part({text, T}) ->
     #{<<"type">> => <<"input_text">>, <<"text">> => to_bin(T)};

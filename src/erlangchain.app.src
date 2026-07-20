@@ -1,6 +1,6 @@
 {application, erlangchain,
- [{description, "Minimal LLM client (OpenAI / Anthropic) and JSON codec for Erlang"},
-  {vsn, "0.1.0"},
+ [{description, "Minimal OpenAI and Anthropic client with datasource support"},
+  {vsn, "0.2.0"},
   {registered, []},
   {applications, [kernel, stdlib, inets, ssl]},
   {env, []},
