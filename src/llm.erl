@@ -35,8 +35,9 @@
 %% Tools    = [#{name => binary(), description => binary(), parameters => map()}]
 %% Datasource = none | binary()  OpenAI vector store id; other providers do not support it.
 %% Opts     = #{model => string(), reasoning_effort => atom()}   optional overrides
-%%            reasoning_effort: OpenAI Responses API only; sent as reasoning.effort.
-%%            Default for Provider=openai, Size=big is medium; omit by overriding in Opts if needed.
+%%            reasoning_effort: OpenAI Responses (reasoning.effort) and OpenRouter
+%%            Chat Completions (reasoning.effort). Default for Provider=openai,
+%%            Size=big is medium; omit by overriding in Opts if needed.
 %%
 %% OpenAI uses POST /v1/responses (not chat/completions); tools + reasoning use this API.
 %%
@@ -350,23 +351,28 @@ openrouter_chat(Size, Messages, Tools, Opts) ->
     ensure_started(),
     Key = require_env("OPENROUTER_API_KEY"),
     Model = maps:get(model, Opts, default_model(opensource, Size)),
-    Body = openrouter_body(Model, Messages, Tools),
+    Body = openrouter_body(Model, Messages, Tools, Opts),
     Headers = [{"authorization", "Bearer " ++ Key}],
     case post(?OPENROUTER_CHAT_URL, Headers, Body) of
-        {ok, Resp} -> {ok, parse_openrouter_response(Resp)};
+        {ok, Resp} -> parse_openrouter_response(Resp);
         Err        -> Err
     end.
 
-openrouter_body(Model, Messages, Tools) ->
+openrouter_body(Model, Messages, Tools, Opts) ->
     Base = #{<<"model">> => to_bin(Model),
              <<"messages">> => [openrouter_message(M) || M <- Messages],
              <<"max_tokens">> => ?MAX_TOKENS},
-    Request = case Tools of
-                  [] -> Base;
-                  _  -> Base#{<<"tools">> => [openrouter_tool(T) || T <- Tools],
-                              <<"tool_choice">> => <<"auto">>}
-              end,
-    json_util:encode(Request).
+    B1 = case Tools of
+             [] -> Base;
+             _  -> Base#{<<"tools">> => [openrouter_tool(T) || T <- Tools],
+                         <<"tool_choice">> => <<"auto">>}
+         end,
+    B2 = case maps:get(reasoning_effort, Opts, undefined) of
+             undefined -> B1;
+             Eff ->
+                 B1#{<<"reasoning">> => #{<<"effort">> => to_bin(Eff)}}
+         end,
+    json_util:encode(B2).
 
 openrouter_message(#{role := tool_result, tool_use_id := Id, content := C}) ->
     #{<<"role">> => <<"tool">>,
@@ -405,19 +411,27 @@ openrouter_tool_call(#{id := Id, name := Name, input := Input}) ->
       <<"function">> => #{<<"name">> => to_bin(Name),
                            <<"arguments">> => json_util:encode(Input)}}.
 
+parse_openrouter_response(#{<<"error">> := Error}) ->
+    {error, {openrouter, Error}};
 parse_openrouter_response(Resp) ->
-    [Choice | _] = maps:get(<<"choices">>, Resp),
-    Message = maps:get(<<"message">>, Choice),
-    Text = case maps:get(<<"content">>, Message, null) of
-               null -> <<>>;
-               C    -> C
-           end,
-    Calls = [parse_openrouter_tool_call(TC)
-             || TC <- maps:get(<<"tool_calls">>, Message, [])],
-    #{role => assistant,
-      content => Text,
-      tool_calls => Calls,
-      usage => parse_openrouter_usage(Resp)}.
+    case maps:get(<<"choices">>, Resp, undefined) of
+        [Choice | _] ->
+            Message = maps:get(<<"message">>, Choice, #{}),
+            Text = case maps:get(<<"content">>, Message, null) of
+                       null -> <<>>;
+                       C    -> C
+                   end,
+            Calls = [parse_openrouter_tool_call(TC)
+                     || TC <- maps:get(<<"tool_calls">>, Message, [])],
+            {ok, #{role => assistant,
+                   content => Text,
+                   tool_calls => Calls,
+                   usage => parse_openrouter_usage(Resp)}};
+        [] ->
+            {error, {openrouter, empty_choices}};
+        undefined ->
+            {error, {openrouter, {missing_choices, Resp}}}
+    end.
 
 parse_openrouter_tool_call(TC) ->
     Function = maps:get(<<"function">>, TC),
