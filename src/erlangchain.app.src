@@ -1,5 +1,5 @@
 {application, erlangchain,
- [{description, "Minimal OpenAI and Anthropic client with datasource support"},
+ [{description, "Minimal OpenAI, Anthropic, and OpenRouter client with datasource support"},
   {vsn, "0.2.0"},
   {registered, []},
   {applications, [kernel, stdlib, inets, ssl]},

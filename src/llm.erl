@@ -4,14 +4,20 @@
 
 -define(ANTHROPIC_URL, "https://api.anthropic.com/v1/messages").
 -define(OPENAI_RESPONSES_URL, "https://api.openai.com/v1/responses").
+-define(OPENROUTER_CHAT_URL, "https://openrouter.ai/api/v1/chat/completions").
 -define(ANTHROPIC_VER, "2023-06-01").
 -define(MAX_TOKENS, 16384).
 -define(TIMEOUT_MS, 300000).
 
 -define(ANTHROPIC_BIG,   "claude-sonnet-4-20250514").
 -define(ANTHROPIC_SMALL, "claude-haiku-3-5-20241022").
+-define(ANTHROPIC_FRONTIER, "fable-5").
 -define(OPENAI_BIG,      "gpt-5.6-terra").
 -define(OPENAI_SMALL,    "gpt-5.6-luna").
+-define(OPENAI_FRONTIER, "gpt-5.6-sol").
+-define(OPENSOURCE_BIG,  "z-ai/glm-5.2").
+-define(OPENSOURCE_SMALL,"openai/gpt-oss-20b").
+-define(OPENSOURCE_FRONTIER, "moonshotai/kimi-k3").
 
 %% -------------------------------------------------------------------
 %% Public API
@@ -22,12 +28,12 @@
 %%   chat(Provider, Size, Messages, Tools, Datasource, Opts)
 %%                                                -> {ok, Resp} | {error, _}
 %%
-%% Provider = anthropic | openai
-%% Size     = big | small
+%% Provider = anthropic | openai | opensource
+%% TierOrModel = frontier | big | small | string() | binary()
 %% Messages = [#{role => ..., content => ...} | #{role => user, parts => [...]} | ...]
 %% User multimodal: #{role => user, parts => [{text, _} | {image_base64, Mime, B64}]}
 %% Tools    = [#{name => binary(), description => binary(), parameters => map()}]
-%% Datasource = none | binary()  OpenAI vector store id; Anthropic does not support it.
+%% Datasource = none | binary()  OpenAI vector store id; other providers do not support it.
 %% Opts     = #{model => string(), reasoning_effort => atom()}   optional overrides
 %%            reasoning_effort: OpenAI Responses API only; sent as reasoning.effort.
 %%            Default for Provider=openai, Size=big is medium; omit by overriding in Opts if needed.
@@ -59,8 +65,13 @@ chat(Provider, Size, Messages, Tools) ->
 chat(Provider, Size, Messages, Tools, Opts) ->
     chat(Provider, Size, Messages, Tools, none, Opts).
 
--spec chat(anthropic | openai, big | small, [map()], [map()], datasource(), map()) ->
+-spec chat(anthropic | openai | opensource | string() | binary(),
+           frontier | big | small | string() | binary(),
+           [map()], [map()], datasource(), map()) ->
     {ok, map()} | {error, term()}.
+chat(Provider, TierOrModel, Messages, Tools, Datasource, Opts)
+  when is_list(Provider); is_binary(Provider) ->
+    chat(provider_atom(Provider), TierOrModel, Messages, Tools, Datasource, Opts);
 chat(anthropic, Size, Messages, Tools, none, Opts) ->
     anthropic_chat(Size, Messages, Tools, Opts);
 chat(anthropic, _Size, _Messages, _Tools, Datasource, _Opts)
@@ -68,18 +79,29 @@ chat(anthropic, _Size, _Messages, _Tools, Datasource, _Opts)
     {error, {unsupported_feature, datasource}};
 chat(openai, Size, Messages, Tools, Datasource, Opts)
   when Datasource =:= none; is_binary(Datasource) ->
-    openai_chat(Size, Messages, Tools, Datasource, Opts).
+    openai_chat(Size, Messages, Tools, Datasource, Opts);
+chat(opensource, Size, Messages, Tools, none, Opts) ->
+    openrouter_chat(Size, Messages, Tools, Opts);
+chat(opensource, _Size, _Messages, _Tools, Datasource, _Opts)
+  when is_binary(Datasource) ->
+    {error, {unsupported_feature, datasource}}.
 
 default_model(anthropic, big)   -> ?ANTHROPIC_BIG;
 default_model(anthropic, small) -> ?ANTHROPIC_SMALL;
+default_model(anthropic, frontier) -> ?ANTHROPIC_FRONTIER;
 default_model(openai, big)      -> ?OPENAI_BIG;
-default_model(openai, small)    -> ?OPENAI_SMALL.
+default_model(openai, small)    -> ?OPENAI_SMALL;
+default_model(openai, frontier) -> ?OPENAI_FRONTIER;
+default_model(opensource, big)  -> ?OPENSOURCE_BIG;
+default_model(opensource, small)-> ?OPENSOURCE_SMALL;
+default_model(opensource, frontier) -> ?OPENSOURCE_FRONTIER;
+default_model(_Provider, Model) when is_list(Model); is_binary(Model) -> Model.
 
 %% Public: returns the actual model id that chat/3..4 will hit for a given
 %% Provider/Size pair (no Opts overrides, since the agent never sets any).
 %% Useful for logging the real model name in training transcripts.
 model_for(Provider, Size) ->
-    default_model(Provider, Size).
+    default_model(provider_atom(Provider), Size).
 
 %%--- Anthropic ------------------------------------------------------
 
@@ -322,6 +344,100 @@ parse_openai_responses_usage(Resp) ->
               reasoning  => Reasoning}
     end.
 
+%%--- OpenRouter (OpenAI-compatible Chat Completions) ----------------
+
+openrouter_chat(Size, Messages, Tools, Opts) ->
+    ensure_started(),
+    Key = require_env("OPENROUTER_API_KEY"),
+    Model = maps:get(model, Opts, default_model(opensource, Size)),
+    Body = openrouter_body(Model, Messages, Tools),
+    Headers = [{"authorization", "Bearer " ++ Key}],
+    case post(?OPENROUTER_CHAT_URL, Headers, Body) of
+        {ok, Resp} -> {ok, parse_openrouter_response(Resp)};
+        Err        -> Err
+    end.
+
+openrouter_body(Model, Messages, Tools) ->
+    Base = #{<<"model">> => to_bin(Model),
+             <<"messages">> => [openrouter_message(M) || M <- Messages],
+             <<"max_tokens">> => ?MAX_TOKENS},
+    Request = case Tools of
+                  [] -> Base;
+                  _  -> Base#{<<"tools">> => [openrouter_tool(T) || T <- Tools],
+                              <<"tool_choice">> => <<"auto">>}
+              end,
+    json_util:encode(Request).
+
+openrouter_message(#{role := tool_result, tool_use_id := Id, content := C}) ->
+    #{<<"role">> => <<"tool">>,
+      <<"tool_call_id">> => to_bin(Id),
+      <<"content">> => to_bin(C)};
+openrouter_message(#{role := user, parts := Parts}) ->
+    #{<<"role">> => <<"user">>,
+      <<"content">> => [openrouter_user_part(P) || P <- Parts]};
+openrouter_message(#{role := assistant} = M) ->
+    Text = maps:get(content, M, <<>>),
+    Calls = maps:get(tool_calls, M, []),
+    Base = #{<<"role">> => <<"assistant">>, <<"content">> => to_bin(Text)},
+    case Calls of
+        [] -> Base;
+        _  -> Base#{<<"tool_calls">> => [openrouter_tool_call(TC) || TC <- Calls]}
+    end;
+openrouter_message(#{role := Role, content := Content}) ->
+    #{<<"role">> => atom_to_binary(Role), <<"content">> => to_bin(Content)}.
+
+openrouter_user_part({text, T}) ->
+    #{<<"type">> => <<"text">>, <<"text">> => to_bin(T)};
+openrouter_user_part({image_base64, Mime, B64}) ->
+    Url = iolist_to_binary(["data:", to_bin(Mime), ";base64,", B64]),
+    #{<<"type">> => <<"image_url">>,
+      <<"image_url">> => #{<<"url">> => Url}}.
+
+openrouter_tool(#{name := N, description := D, parameters := P}) ->
+    #{<<"type">> => <<"function">>,
+      <<"function">> => #{<<"name">> => to_bin(N),
+                           <<"description">> => to_bin(D),
+                           <<"parameters">> => P}}.
+
+openrouter_tool_call(#{id := Id, name := Name, input := Input}) ->
+    #{<<"id">> => to_bin(Id),
+      <<"type">> => <<"function">>,
+      <<"function">> => #{<<"name">> => to_bin(Name),
+                           <<"arguments">> => json_util:encode(Input)}}.
+
+parse_openrouter_response(Resp) ->
+    [Choice | _] = maps:get(<<"choices">>, Resp),
+    Message = maps:get(<<"message">>, Choice),
+    Text = case maps:get(<<"content">>, Message, null) of
+               null -> <<>>;
+               C    -> C
+           end,
+    Calls = [parse_openrouter_tool_call(TC)
+             || TC <- maps:get(<<"tool_calls">>, Message, [])],
+    #{role => assistant,
+      content => Text,
+      tool_calls => Calls,
+      usage => parse_openrouter_usage(Resp)}.
+
+parse_openrouter_tool_call(TC) ->
+    Function = maps:get(<<"function">>, TC),
+    Arguments = maps:get(<<"arguments">>, Function, <<"{}">>),
+    #{id => maps:get(<<"id">>, TC),
+      name => maps:get(<<"name">>, Function),
+      input => json_util:decode(Arguments)}.
+
+parse_openrouter_usage(Resp) ->
+    case maps:get(<<"usage">>, Resp, null) of
+        null -> #{in => 0, out => 0, cache_read => 0, reasoning => 0};
+        U ->
+            PromptDetails = maps:get(<<"prompt_tokens_details">>, U, #{}),
+            CompletionDetails = maps:get(<<"completion_tokens_details">>, U, #{}),
+            #{in => maps:get(<<"prompt_tokens">>, U, 0),
+              out => maps:get(<<"completion_tokens">>, U, 0),
+              cache_read => maps:get(<<"cached_tokens">>, PromptDetails, 0),
+              reasoning => maps:get(<<"reasoning_tokens">>, CompletionDetails, 0)}
+    end.
+
 %%--- HTTP (inets) ---------------------------------------------------
 
 ensure_started() ->
@@ -374,6 +490,16 @@ anthropic_user_part({image_base64, Mime, B64}) ->
     }}.
 
 %%--- Helpers --------------------------------------------------------
+
+provider_atom(openai) -> openai;
+provider_atom(anthropic) -> anthropic;
+provider_atom(opensource) -> opensource;
+provider_atom("openai") -> openai;
+provider_atom("anthropic") -> anthropic;
+provider_atom("opensource") -> opensource;
+provider_atom(<<"openai">>) -> openai;
+provider_atom(<<"anthropic">>) -> anthropic;
+provider_atom(<<"opensource">>) -> opensource.
 
 require_env(Name) ->
     case os:getenv(Name) of
