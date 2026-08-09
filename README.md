@@ -7,7 +7,7 @@ dependencies.
 
 | Module      | Role                                                          |
 |-------------|---------------------------------------------------------------|
-| `llm`       | one-call chat client for OpenAI, Anthropic, and OpenRouter-hosted open-source models, with tool-use and multimodal support |
+| `llm`       | chat and image-generation client for OpenAI, Anthropic, OpenRouter, and Hugging Face Inference Providers |
 | `llm_datasource` | create and manage provider-backed vector-store datasources |
 | `json_util` | dependency-free JSON encode/decode                            |
 
@@ -20,9 +20,9 @@ dependencies.
 ]}.
 ```
 
-Set `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and/or `OPENROUTER_API_KEY` in the
-environment (a `.env` file in the working directory is loaded automatically if
-present).
+Set `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, and/or
+`HF_TOKEN` in the environment (a `.env` file in the working directory is loaded
+automatically if present).
 
 ## llm
 
@@ -35,6 +35,10 @@ present).
 
 %% Open-source models through OpenRouter:
 {ok, Resp} = llm:chat(opensource, small, Messages),
+
+%% Image generation through Hugging Face's fal-ai provider:
+{ok, #{image := ImageBytes, content_type := MimeType}} =
+    llm:image(opensource, large, <<"Astronaut riding a horse">>),
 
 %% Frontier tier, or an exact model slug:
 {ok, Resp} = llm:chat(openai, frontier, Messages),
@@ -68,6 +72,10 @@ Alternatively, pass `#{model => "provider/model"}` in `Opts`. `Datasource` is
 vector-store datasources. See the header of `src/llm.erl` for the full
 message/response shapes. Deleting datasource files detaches them from that
 vector store; it does not permanently delete the uploaded OpenAI files.
+
+`llm:image(opensource, large, Prompt)` uses
+`black-forest-labs/FLUX.1-dev` through Hugging Face's `fal-ai` provider. It
+requires `HF_TOKEN` and returns the encoded image bytes and their MIME type.
 
 ## json_util
 

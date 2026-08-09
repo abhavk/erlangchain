@@ -1,10 +1,12 @@
 -module(llm).
--export([chat/1, chat/3, chat/4, chat/5, chat/6, model_for/2]).
+-export([chat/1, chat/3, chat/4, chat/5, chat/6, image/3, model_for/2]).
 -export_type([datasource/0]).
 
 -define(ANTHROPIC_URL, "https://api.anthropic.com/v1/messages").
 -define(OPENAI_RESPONSES_URL, "https://api.openai.com/v1/responses").
 -define(OPENROUTER_CHAT_URL, "https://openrouter.ai/api/v1/chat/completions").
+-define(HUGGINGFACE_FAL_FLUX_DEV_URL,
+        "https://router.huggingface.co/fal-ai/fal-ai/flux/dev").
 -define(ANTHROPIC_VER, "2023-06-01").
 -define(MAX_TOKENS, 16384).
 -define(TIMEOUT_MS, 300000).
@@ -27,6 +29,7 @@
 %%   chat(Provider, Size, Messages, Tools, Opts) -> {ok, Resp} | {error, _}
 %%   chat(Provider, Size, Messages, Tools, Datasource, Opts)
 %%                                                -> {ok, Resp} | {error, _}
+%%   image(opensource, large, Prompt)              -> {ok, ImageResp} | {error, _}
 %%
 %% Provider = anthropic | openai | opensource
 %% TierOrModel = frontier | big | small | string() | binary()
@@ -46,6 +49,7 @@
 %%                         reasoning => integer()}}
 %%              reasoning: OpenAI Responses only; output-side reasoning_tokens (subset of out).
 %% Each tool call = #{id => binary(), name => binary(), input => map()}
+%% ImageResp = #{image => binary(), content_type => binary()}
 %%
 %% To continue a multi-turn conversation, append the response to your
 %% messages list, then add tool results as:
@@ -86,6 +90,15 @@ chat(opensource, Size, Messages, Tools, none, Opts) ->
 chat(opensource, _Size, _Messages, _Tools, Datasource, _Opts)
   when is_binary(Datasource) ->
     {error, {unsupported_feature, datasource}}.
+
+%% Generate an image through Hugging Face Inference Providers using fal-ai
+%% and black-forest-labs/FLUX.1-dev.
+-spec image(opensource | string() | binary(), large, string() | binary()) ->
+    {ok, map()} | {error, term()}.
+image(Provider, Size, Prompt) when is_list(Provider); is_binary(Provider) ->
+    image(provider_atom(Provider), Size, Prompt);
+image(opensource, large, Prompt) when is_list(Prompt); is_binary(Prompt) ->
+    fal_image(Prompt).
 
 default_model(anthropic, big)   -> ?ANTHROPIC_BIG;
 default_model(anthropic, small) -> ?ANTHROPIC_SMALL;
@@ -452,6 +465,36 @@ parse_openrouter_usage(Resp) ->
               reasoning => maps:get(<<"reasoning_tokens">>, CompletionDetails, 0)}
     end.
 
+%%--- Hugging Face / fal-ai image generation ------------------------
+
+fal_image(Prompt) ->
+    ensure_started(),
+    Key = require_env("HF_TOKEN"),
+    Body = json_util:encode(#{<<"prompt">> => to_bin(Prompt)}),
+    Headers = [{"authorization", "Bearer " ++ Key}],
+    case post(?HUGGINGFACE_FAL_FLUX_DEV_URL, Headers, Body) of
+        {ok, Resp} -> parse_fal_image_response(Resp);
+        Err        -> Err
+    end.
+
+parse_fal_image_response(#{<<"error">> := Error}) ->
+    {error, {huggingface, Error}};
+parse_fal_image_response(
+  #{<<"images">> := [#{<<"url">> := Url} = Image | _]}) ->
+    ContentType = maps:get(<<"content_type">>, Image,
+                           <<"application/octet-stream">>),
+    case get_binary(Url) of
+        {ok, ImageBin} ->
+            {ok, #{image => ImageBin,
+                   content_type => to_bin(ContentType)}};
+        Err ->
+            Err
+    end;
+parse_fal_image_response(#{<<"images">> := [Image | _]}) ->
+    {error, {huggingface, {missing_image_url, Image}}};
+parse_fal_image_response(Resp) ->
+    {error, {huggingface, {missing_images, Resp}}}.
+
 %%--- HTTP (inets) ---------------------------------------------------
 
 ensure_started() ->
@@ -488,6 +531,20 @@ post(Url, Headers, Body) ->
             [{body_format, binary}]) of
         {ok, {{_, S, _}, _, RespBody}} when S >= 200, S < 300 ->
             {ok, json_util:decode(RespBody)};
+        {ok, {{_, S, _}, _, RespBody}} ->
+            {error, {http, S, RespBody}};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+get_binary(Url) ->
+    case httpc:request(get,
+            {binary_to_list(to_bin(Url)), []},
+            [{ssl, [{verify, verify_none}]}, {timeout, ?TIMEOUT_MS},
+             {autoredirect, true}],
+            [{body_format, binary}]) of
+        {ok, {{_, S, _}, _, RespBody}} when S >= 200, S < 300 ->
+            {ok, RespBody};
         {ok, {{_, S, _}, _, RespBody}} ->
             {error, {http, S, RespBody}};
         {error, Reason} ->
