@@ -10,6 +10,7 @@
 -define(ANTHROPIC_VER, "2023-06-01").
 -define(MAX_TOKENS, 16384).
 -define(TIMEOUT_MS, 300000).
+-define(FAL_POLL_MS, 500).
 
 -define(ANTHROPIC_BIG,   "claude-sonnet-4-20250514").
 -define(ANTHROPIC_SMALL, "claude-haiku-3-5-20241022").
@@ -473,14 +474,35 @@ fal_image(Prompt) ->
     Body = json_util:encode(#{<<"prompt">> => to_bin(Prompt)}),
     Headers = [{"authorization", "Bearer " ++ Key}],
     case post(?HUGGINGFACE_FAL_FLUX_DEV_URL, Headers, Body) of
-        {ok, Resp} -> parse_fal_image_response(Resp);
+        {ok, Resp} -> parse_fal_image_response(Resp, Headers);
         Err        -> Err
     end.
 
-parse_fal_image_response(#{<<"error">> := Error}) ->
+%% Hugging Face's fal-ai router often accepts the job and returns
+%% request_id / status_url immediately. Poll until COMPLETED, then
+%% download images[0].url. A completed payload is handled the same way.
+parse_fal_image_response(#{<<"error">> := Error}, _Headers) ->
     {error, {huggingface, Error}};
 parse_fal_image_response(
-  #{<<"images">> := [#{<<"url">> := Url} = Image | _]}) ->
+  #{<<"images">> := [#{<<"url">> := Url} = Image | _]}, _Headers) ->
+    fetch_fal_image(Url, Image);
+parse_fal_image_response(#{<<"images">> := [Image | _]}, _Headers) ->
+    {error, {huggingface, {missing_image_url, Image}}};
+parse_fal_image_response(#{<<"request_id">> := _} = Queue, Headers) ->
+    await_fal_queue(Queue, Headers);
+parse_fal_image_response(Resp, _Headers) ->
+    {error, {huggingface, {missing_images, Resp}}}.
+
+fetch_fal_image(<<"data:", Rest/binary>>, Image) ->
+    case binary:split(Rest, <<",">>) of
+        [_Meta, B64] ->
+            ContentType = maps:get(<<"content_type">>, Image, <<"image/jpeg">>),
+            {ok, #{image => base64:decode(B64),
+                   content_type => to_bin(ContentType)}};
+        _ ->
+            {error, {huggingface, {invalid_data_url, Image}}}
+    end;
+fetch_fal_image(Url, Image) ->
     ContentType = maps:get(<<"content_type">>, Image,
                            <<"application/octet-stream">>),
     case get_binary(Url) of
@@ -489,11 +511,78 @@ parse_fal_image_response(
                    content_type => to_bin(ContentType)}};
         Err ->
             Err
-    end;
-parse_fal_image_response(#{<<"images">> := [Image | _]}) ->
+    end.
+
+await_fal_queue(Queue, Headers) ->
+    {StatusUrl, ResultUrl} = fal_queue_urls(Queue),
+    Deadline = erlang:monotonic_time(millisecond) + ?TIMEOUT_MS,
+    case poll_fal_queue(Headers, StatusUrl, ResultUrl, Deadline) of
+        {ok, Result} -> parse_fal_queue_result(Result);
+        Err -> Err
+    end.
+
+parse_fal_queue_result(#{<<"error">> := Error}) ->
+    {error, {huggingface, Error}};
+parse_fal_queue_result(
+  #{<<"images">> := [#{<<"url">> := Url} = Image | _]}) ->
+    fetch_fal_image(Url, Image);
+parse_fal_queue_result(#{<<"images">> := [Image | _]}) ->
     {error, {huggingface, {missing_image_url, Image}}};
-parse_fal_image_response(Resp) ->
+parse_fal_queue_result(Resp) ->
     {error, {huggingface, {missing_images, Resp}}}.
+
+fal_queue_urls(#{<<"request_id">> := RequestId} = Queue) ->
+    DefaultStatus = iolist_to_binary(
+        [?HUGGINGFACE_FAL_FLUX_DEV_URL, "/requests/", RequestId, "/status"]),
+    DefaultResult = iolist_to_binary(
+        [?HUGGINGFACE_FAL_FLUX_DEV_URL, "/requests/", RequestId, "/response"]),
+    {rewrite_hf_fal_url(maps:get(<<"status_url">>, Queue, DefaultStatus)),
+     rewrite_hf_fal_url(maps:get(<<"response_url">>, Queue, DefaultResult))}.
+
+%% HF tokens cannot call queue.fal.run directly; rewrite onto the HF router.
+rewrite_hf_fal_url(Url) ->
+    case uri_string:parse(to_bin(Url)) of
+        #{host := Host} = Parsed when is_map(Parsed) ->
+            Path = to_bin(maps:get(path, Parsed, <<>>)),
+            Query = case maps:get(query, Parsed, undefined) of
+                        undefined -> <<>>;
+                        Q -> <<$?, (to_bin(Q))/binary>>
+                    end,
+            case to_bin(Host) of
+                <<"queue.fal.run">> ->
+                    binary_to_list(<<"https://router.huggingface.co/fal-ai",
+                                     Path/binary, Query/binary>>);
+                <<"fal.run">> ->
+                    binary_to_list(<<"https://router.huggingface.co/fal-ai",
+                                     Path/binary, Query/binary>>);
+                _ ->
+                    binary_to_list(to_bin(Url))
+            end;
+        _ ->
+            binary_to_list(to_bin(Url))
+    end.
+
+poll_fal_queue(Headers, StatusUrl, ResultUrl, Deadline) ->
+    case erlang:monotonic_time(millisecond) > Deadline of
+        true ->
+            {error, {huggingface, queue_timeout}};
+        false ->
+            case get_json(StatusUrl, Headers) of
+                {ok, #{<<"status">> := <<"COMPLETED">>}} ->
+                    get_json(ResultUrl, Headers);
+                {ok, #{<<"status">> := <<"FAILED">>} = Status} ->
+                    {error, {huggingface, {queue_failed, Status}}};
+                {ok, #{<<"status">> := Status}}
+                  when Status =:= <<"IN_QUEUE">>;
+                       Status =:= <<"IN_PROGRESS">> ->
+                    timer:sleep(?FAL_POLL_MS),
+                    poll_fal_queue(Headers, StatusUrl, ResultUrl, Deadline);
+                {ok, Other} ->
+                    {error, {huggingface, {unexpected_queue_status, Other}}};
+                Err ->
+                    Err
+            end
+    end.
 
 %%--- HTTP (inets) ---------------------------------------------------
 
@@ -538,18 +627,27 @@ post(Url, Headers, Body) ->
     end.
 
 get_binary(Url) ->
+    get_request(Url, [], fun(RespBody) -> {ok, RespBody} end).
+
+get_json(Url, Headers) ->
+    get_request(Url, Headers, fun(RespBody) -> {ok, json_util:decode(RespBody)} end).
+
+get_request(Url, Headers, Decode) ->
     case httpc:request(get,
-            {binary_to_list(to_bin(Url)), []},
+            {to_url_string(Url), Headers},
             [{ssl, [{verify, verify_none}]}, {timeout, ?TIMEOUT_MS},
              {autoredirect, true}],
             [{body_format, binary}]) of
         {ok, {{_, S, _}, _, RespBody}} when S >= 200, S < 300 ->
-            {ok, RespBody};
+            Decode(RespBody);
         {ok, {{_, S, _}, _, RespBody}} ->
             {error, {http, S, RespBody}};
         {error, Reason} ->
             {error, Reason}
     end.
+
+to_url_string(Url) when is_list(Url) -> Url;
+to_url_string(Url) -> binary_to_list(to_bin(Url)).
 
 anthropic_user_part({text, T}) ->
     #{<<"type">> => <<"text">>, <<"text">> => to_bin(T)};
