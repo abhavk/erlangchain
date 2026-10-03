@@ -1,6 +1,6 @@
 {application, erlangchain,
  [{description, "Minimal LLM and image-generation client with datasource support"},
-  {vsn, "4.2.2"},
+  {vsn, "4.2.3"},
   {registered, []},
   {applications, [kernel, stdlib, inets, ssl]},
   {env, []},

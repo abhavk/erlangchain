@@ -63,7 +63,7 @@
 %%              cache_write and cache_write_1h: Anthropic only. cache_write_1h
 %%              is the 1-hour portion of cache_write.
 %%              An assistant map may also include thinking => [Block].
-%%              Those blocks are sent back unchanged on the next turn.
+%%              Those blocks are sent back on the next turn.
 %%              The field is left off when the model sent no thinking.
 %%   cost(Provider, Model, Usage) -> {ok, CostUsd} | {error, unknown_model}
 %%   cost(Provider, Model, Usage, Prices) -> same
@@ -524,7 +524,7 @@ parse_openrouter_response(Resp) ->
                        C    -> C
                    end,
             Calls = [parse_openrouter_tool_call(TC)
-                     || TC <- maps:get(<<"tool_calls">>, Message, [])],
+                     || TC <- as_list(maps:get(<<"tool_calls">>, Message, []))],
             {ok, put_thinking(#{role => assistant,
                                 content => Text,
                                 tool_calls => Calls,
@@ -550,7 +550,7 @@ openrouter_thinking(Message) ->
         _ ->
             case reasoning_text(Message) of
                 <<>> -> [];
-                Text -> [#{<<"type">> => <<"reasoning.text">>, <<"text">> => Text}]
+                Text -> [#{<<"type">> => <<"reasoning">>, <<"text">> => Text}]
             end
     end.
 
@@ -565,7 +565,7 @@ reasoning_text(Message) ->
 openrouter_thinking_replay([]) ->
     none;
 openrouter_thinking_replay(Blocks) ->
-    case lists:all(fun(B) -> maps:get(<<"type">>, B, undefined) =:= <<"reasoning.text">> end, Blocks) of
+    case lists:all(fun plain_reasoning_text/1, Blocks) of
         true ->
             Text = lists:foldl(fun(B, Acc) ->
                                    <<Acc/binary, (maps:get(<<"text">>, B, <<>>))/binary>>
@@ -575,17 +575,31 @@ openrouter_thinking_replay(Blocks) ->
             {details, Blocks}
     end.
 
+%% A plain string from the API is stored as one block. Real reasoning_details
+%% use types such as reasoning.text and must be sent back as they arrived.
+plain_reasoning_text(#{<<"type">> := <<"reasoning">>, <<"text">> := Text} = Block)
+  when is_binary(Text) ->
+    maps:size(Block) =:= 2;
+plain_reasoning_text(_) ->
+    false.
+
 put_thinking(Resp, []) ->
     Resp;
 put_thinking(Resp, Thinking) ->
     Resp#{thinking => Thinking}.
 
+as_list(L) when is_list(L) -> L;
+as_list(_) -> [].
+
+usage_details(Map) when is_map(Map) -> Map;
+usage_details(_) -> #{}.
+
 parse_openrouter_usage(Resp) ->
     case maps:get(<<"usage">>, Resp, null) of
         null -> #{in => 0, out => 0, cache_read => 0, reasoning => 0};
         U ->
-            PromptDetails = maps:get(<<"prompt_tokens_details">>, U, #{}),
-            CompletionDetails = maps:get(<<"completion_tokens_details">>, U, #{}),
+            PromptDetails = usage_details(maps:get(<<"prompt_tokens_details">>, U, #{})),
+            CompletionDetails = usage_details(maps:get(<<"completion_tokens_details">>, U, #{})),
             Usage = #{in => maps:get(<<"prompt_tokens">>, U, 0),
                       out => maps:get(<<"completion_tokens">>, U, 0),
                       cache_read => maps:get(<<"cached_tokens">>, PromptDetails, 0),
