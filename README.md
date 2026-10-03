@@ -68,7 +68,7 @@ sent thinking blocks, and those blocks are sent back on the next turn.
 
 %% Frontier tier, or an exact model slug:
 {ok, Resp} = llm:chat(openai, frontier, Messages),
-{ok, Resp} = llm:chat("openai", "exact-model-slug", Messages),
+{ok, Resp} = llm:chat("openai", "model-slug", Messages),
 
 %% Tool use — pass tool specs, get back tool_calls to run and feed back:
 {ok, #{tool_calls := Calls}} = llm:chat(openai, big, Messages, Tools),
@@ -90,14 +90,24 @@ ok = llm_datasource:delete(openai, DatasourceId).
 plus `#{role => tool_result, tool_use_id => Id, content => Bin}` to return tool
 output. The `frontier` models are `gpt-5.6-sol` for OpenAI, `fable-5` for
 Anthropic, and `moonshotai/kimi-k3` for the `opensource` OpenRouter provider.
-The other `opensource` defaults are `openai/gpt-oss-20b` for `small` and
-`z-ai/glm-5.2` for `big`. A tier can be replaced with an exact model slug as a
-string or binary; provider names also accept atoms, strings, or binaries.
+Anthropic `big` is `claude-opus-5-5` and Anthropic `small` is
+`claude-haiku-5-5`. The other `opensource` defaults are `openai/gpt-oss-20b`
+for `small` and `z-ai/glm-5.2` for `big`. A tier can be replaced with an exact
+model slug as a string or binary; provider names also accept atoms, strings, or
+binaries.
 Alternatively, pass `#{model => "provider/model"}` in `Opts`. `Datasource` is
 `none` or an OpenAI vector store id. Other providers do not support managed
 vector-store datasources. See the header of `src/llm.erl` for the full
 message/response shapes. Deleting datasource files detaches them from that
 vector store; it does not permanently delete the uploaded OpenAI files.
+
+## Reasoning effort
+
+Set `reasoning_effort` in `Opts` on any chat call. Leave it out to keep the provider default. An OpenAI `big` call uses `medium` when the option is omitted.
+
+```erlang
+llm:chat(openai, small, Messages, [], #{reasoning_effort => high}).
+```
 
 ## Token cost
 
@@ -115,7 +125,25 @@ includes it.
 `#{pricing => false}` in `Opts` leaves the cost off. `#{prices => PriceList}`
 uses your rates instead of `llm_prices:list/0`. Rates are USD per 1,000,000
 tokens: `#{<<"model">> => #{in => 0.20, out => 1.20, cache_read => 0.02}}`.
-The rules live in `llm_pricing`. `cost_usd` is token cost only.
+The rules live in `llm_pricing`. `cost_usd` is token cost only. Anthropic
+cache writes are included: 5-minute writes at 1.25 times the input rate, and
+1-hour writes at 2 times the input rate.
+
+## Caching
+
+`caching` can be set on any chat call. It changes the request for Anthropic.
+OpenAI and OpenRouter accept it and leave the request as it is.
+
+```erlang
+%% Default. Anthropic sends cache_control with a 5-minute ttl.
+llm:chat(anthropic, big, Messages, [], #{}),
+
+%% Keep the cache for 1 hour, or turn it off:
+llm:chat(anthropic, big, Messages, [], #{caching => one_hour}),
+llm:chat(anthropic, big, Messages, [], #{caching => off}).
+```
+
+An unknown `caching` value returns `{error, {invalid_option, caching}}`.
 
 ## Image generation
 

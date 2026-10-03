@@ -16,7 +16,9 @@
 %% openai and opensource: cache_read is already inside in, and reasoning is
 %% already inside out. Bill (in - cache_read) at the input rate, cache_read
 %% at the cache rate, and out at the output rate.
-%% anthropic: in, cache_read, and out are separate buckets. Bill each one.
+%% anthropic: in, cache_read, cache_write, and out are separate buckets.
+%%            cache_write_1h is the part of cache_write stored for 1 hour
+%%            (2x input). The rest is a 5-minute write (1.25x input).
 %% opensource: a provider_cost from OpenRouter replaces the price list,
 %% because the live route is the real bill.
 
@@ -62,6 +64,7 @@ priced(Provider, Usage, Rates) ->
                        anthropic ->
                            tokens(In, in, Use) +
                            tokens(Cache, cache_read, Use) +
+                           cache_write_cost(Usage, Use) +
                            tokens(Out, out, Use);
                        _ ->
                            tokens(max(0, In - Cache), in, Use) +
@@ -89,6 +92,15 @@ tokens(Count, cache_read, Rates) ->
     Count / 1000000 * maps:get(cache_read, Rates, maps:get(in, Rates));
 tokens(Count, Key, Rates) ->
     Count / 1000000 * maps:get(Key, Rates).
+
+cache_write_cost(Usage, Rates) ->
+    Write = num(cache_write, Usage),
+    Write1h = min(Write, num(cache_write_1h, Usage)),
+    Write5m = max(0, Write - Write1h),
+    In = maps:get(in, Rates),
+    FiveRate = maps:get(cache_write, Rates, In * 1.25),
+    HourRate = maps:get(cache_write_1h, Rates, In * 2.0),
+    Write5m / 1000000 * FiveRate + Write1h / 1000000 * HourRate.
 
 lookup(Model, Prices) ->
     Key = to_bin(Model),

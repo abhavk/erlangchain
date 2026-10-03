@@ -13,8 +13,8 @@
 -define(TIMEOUT_MS, 300000).
 -define(FAL_POLL_MS, 500).
 
--define(ANTHROPIC_BIG,   "claude-sonnet-4-20250514").
--define(ANTHROPIC_SMALL, "claude-haiku-3-5-20241022").
+-define(ANTHROPIC_BIG,   "claude-opus-5-5").
+-define(ANTHROPIC_SMALL, "claude-haiku-5-5").
 -define(ANTHROPIC_FRONTIER, "fable-5").
 -define(OPENAI_BIG,      "gpt-5.6-terra").
 -define(OPENAI_SMALL,    "gpt-5.6-luna").
@@ -40,20 +40,28 @@
 %% Tools    = [#{name => binary(), description => binary(), parameters => map()}]
 %% Datasource = none | binary()  OpenAI vector store id; other providers do not support it.
 %% Opts     = #{model => string(), reasoning_effort => atom(),
-%%              pricing => boolean(), prices => map()}   optional overrides
-%%            reasoning_effort: OpenAI Responses (reasoning.effort) and OpenRouter
-%%            Chat Completions (reasoning.effort). Default for Provider=openai,
-%%            Size=big is medium; omit by overriding in Opts if needed.
+%%              pricing => boolean(), prices => map(),
+%%              caching => five_minutes | one_hour | off}   optional overrides
+%%            reasoning_effort: OpenAI and OpenRouter send reasoning.effort.
+%%            Anthropic sends output_config.effort. Omitted means the provider
+%%            default. Default for Provider=openai, Size=big is medium; omit by
+%%            overriding in Opts if needed.
 %%            pricing defaults to true. prices replaces llm_prices:list/0.
+%%            caching defaults to five_minutes. Anthropic sends
+%%            cache_control ephemeral ttl 5m or 1h. off sends no cache_control.
+%%            OpenAI and OpenRouter accept the option and do not change the request.
 %%
 %% OpenAI uses POST /v1/responses (not chat/completions); tools + reasoning use this API.
 %%
 %% Response = #{role => assistant, content => binary(), tool_calls => [...],
 %%              usage => #{in => integer(), out => integer(), cache_read => integer(),
+%%                         cache_write => integer(), cache_write_1h => integer(),
 %%                         reasoning => integer(), cost_usd => float()}}
 %%              reasoning: subset of out. OpenAI and OpenRouter report reasoning_tokens.
 %%              Anthropic reports output_tokens_details.thinking_tokens.
 %%              cost_usd is present when pricing is on and a rate is known.
+%%              cache_write and cache_write_1h: Anthropic only. cache_write_1h
+%%              is the 1-hour portion of cache_write.
 %%              An Anthropic assistant map may also include thinking => [Block].
 %%              Those blocks are sent back unchanged on the next turn.
 %%   cost(Provider, Model, Usage) -> {ok, CostUsd} | {error, unknown_model}
@@ -88,15 +96,21 @@ chat(Provider, TierOrModel, Messages, Tools, Datasource, Opts)
   when is_list(Provider); is_binary(Provider) ->
     chat(provider_atom(Provider), TierOrModel, Messages, Tools, Datasource, Opts);
 chat(anthropic, Size, Messages, Tools, none, Opts) ->
-    anthropic_chat(Size, Messages, Tools, Opts);
+    with_caching(Opts, fun(Strategy) ->
+        anthropic_chat(Size, Messages, Tools, Opts, Strategy)
+    end);
 chat(anthropic, _Size, _Messages, _Tools, Datasource, _Opts)
   when is_binary(Datasource) ->
     {error, {unsupported_feature, datasource}};
 chat(openai, Size, Messages, Tools, Datasource, Opts)
   when Datasource =:= none; is_binary(Datasource) ->
-    openai_chat(Size, Messages, Tools, Datasource, Opts);
+    with_caching(Opts, fun(_Strategy) ->
+        openai_chat(Size, Messages, Tools, Datasource, Opts)
+    end);
 chat(opensource, Size, Messages, Tools, none, Opts) ->
-    openrouter_chat(Size, Messages, Tools, Opts);
+    with_caching(Opts, fun(_Strategy) ->
+        openrouter_chat(Size, Messages, Tools, Opts)
+    end);
 chat(opensource, _Size, _Messages, _Tools, Datasource, _Opts)
   when is_binary(Datasource) ->
     {error, {unsupported_feature, datasource}}.
@@ -135,14 +149,15 @@ model_for(Provider, Size) ->
 
 %%--- Anthropic ------------------------------------------------------
 
-anthropic_chat(Size, Messages, Tools, Opts) ->
+anthropic_chat(Size, Messages, Tools, Opts, Strategy) ->
     ensure_started(),
     Key = require_env("ANTHROPIC_API_KEY"),
     Model = maps:get(model, Opts, default_model(anthropic, Size)),
     {System, Msgs} = extract_system(Messages),
     Body = anthropic_body(Model, System,
                           [anthropic_msg(M) || M <- Msgs],
-                          [anthropic_tool(T) || T <- Tools]),
+                          [anthropic_tool(T) || T <- Tools],
+                          Strategy, Opts),
     Headers = [{"x-api-key", Key},
                {"anthropic-version", ?ANTHROPIC_VER}],
     case post(?ANTHROPIC_URL, Headers, Body) of
@@ -150,7 +165,7 @@ anthropic_chat(Size, Messages, Tools, Opts) ->
         Err        -> Err
     end.
 
-anthropic_body(Model, System, Msgs, Tools) ->
+anthropic_body(Model, System, Msgs, Tools, Strategy, Opts) ->
     Base = #{<<"model">>      => to_bin(Model),
              <<"max_tokens">> => ?MAX_TOKENS,
              <<"messages">>   => Msgs},
@@ -162,7 +177,15 @@ anthropic_body(Model, System, Msgs, Tools) ->
              [] -> B1;
              _  -> B1#{<<"tools">> => Tools}
          end,
-    json_util:encode(B2).
+    B3 = case cache_control(Strategy) of
+             none -> B2;
+             Control -> B2#{<<"cache_control">> => Control}
+         end,
+    B4 = case maps:get(reasoning_effort, Opts, undefined) of
+             undefined -> B3;
+             Eff -> B3#{<<"output_config">> => #{<<"effort">> => to_bin(Eff)}}
+         end,
+    json_util:encode(B4).
 
 extract_system(Messages) ->
     case lists:partition(fun(M) -> maps:get(role, M) =:= system end, Messages) of
@@ -360,7 +383,8 @@ extract_assistant_output_text(Item) ->
 
 parse_anthropic_usage(Resp) ->
     case maps:get(<<"usage">>, Resp, null) of
-        null -> #{in => 0, out => 0, cache_read => 0, reasoning => 0};
+        null -> #{in => 0, out => 0, cache_read => 0, cache_write => 0,
+                  reasoning => 0};
         U    ->
             Details = maps:get(<<"output_tokens_details">>, U, #{}),
             Thinking = case Details of
@@ -369,9 +393,18 @@ parse_anthropic_usage(Resp) ->
                            _ ->
                                0
                        end,
+            Creation = maps:get(<<"cache_creation">>, U, #{}),
+            Write1h = case Creation of
+                          C when is_map(C) ->
+                              maps:get(<<"ephemeral_1h_input_tokens">>, C, 0);
+                          _ ->
+                              0
+                      end,
             #{in         => maps:get(<<"input_tokens">>, U, 0),
               out        => maps:get(<<"output_tokens">>, U, 0),
               cache_read => maps:get(<<"cache_read_input_tokens">>, U, 0),
+              cache_write => maps:get(<<"cache_creation_input_tokens">>, U, 0),
+              cache_write_1h => Write1h,
               reasoning  => Thinking}
     end.
 
@@ -734,6 +767,36 @@ require_env(Name) ->
         false -> error({missing_env, Name});
         Val   -> Val
     end.
+
+with_caching(Opts, Fun) ->
+    case caching_strategy(maps:get(caching, Opts, five_minutes)) of
+        {ok, Strategy} -> Fun(Strategy);
+        error -> {error, {invalid_option, caching}}
+    end.
+
+%% five_minutes is the Anthropic default: cache_control ephemeral, ttl 5m.
+%% one_hour uses ttl 1h. off omits cache_control.
+caching_strategy(five_minutes) -> {ok, five_minutes};
+caching_strategy(one_hour) -> {ok, one_hour};
+caching_strategy(off) -> {ok, off};
+caching_strategy(false) -> {ok, off};
+caching_strategy(none) -> {ok, off};
+caching_strategy("five_minutes") -> {ok, five_minutes};
+caching_strategy("one_hour") -> {ok, one_hour};
+caching_strategy("off") -> {ok, off};
+caching_strategy("none") -> {ok, off};
+caching_strategy(<<"five_minutes">>) -> {ok, five_minutes};
+caching_strategy(<<"one_hour">>) -> {ok, one_hour};
+caching_strategy(<<"off">>) -> {ok, off};
+caching_strategy(<<"none">>) -> {ok, off};
+caching_strategy(_) -> error.
+
+cache_control(five_minutes) ->
+    #{<<"type">> => <<"ephemeral">>, <<"ttl">> => <<"5m">>};
+cache_control(one_hour) ->
+    #{<<"type">> => <<"ephemeral">>, <<"ttl">> => <<"1h">>};
+cache_control(off) ->
+    none.
 
 to_bin(B) when is_binary(B) -> B;
 to_bin(L) when is_list(L)   -> unicode:characters_to_binary(L);
