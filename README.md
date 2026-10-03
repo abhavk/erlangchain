@@ -36,7 +36,7 @@ vendor.
 ```erlang
 %% rebar.config
 {deps, [
-    {erlangchain, "~> 4.2.0"}
+    {erlangchain, "~> 4.2.2"}
 ]}.
 ```
 
@@ -44,11 +44,11 @@ Set `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, and/or
 `HF_TOKEN` in the environment (a `.env` file in the working directory is loaded
 automatically if present).
 
-**4.2.0** adds token pricing, the `claude-opus-5-5` rate, and Anthropic
-thinking blocks. Chat calls keep the same arguments and the same fields.
+**4.2.2** adds token pricing, the `claude-opus-5-5` rate, and thinking
+blocks from every provider. Chat calls keep the same arguments and the same fields.
 `cost_usd` is added when a price is known. A model with no price still returns
-`{ok, Response}`. An Anthropic reply includes `thinking` only when the API
-sent thinking blocks, and those blocks are sent back on the next turn.
+`{ok, Response}`. A reply includes `thinking` only when the model sent
+thinking blocks, and those blocks are sent back on the next turn.
 
 ## llm
 

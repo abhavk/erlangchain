@@ -62,8 +62,9 @@
 %%              cost_usd is present when pricing is on and a rate is known.
 %%              cache_write and cache_write_1h: Anthropic only. cache_write_1h
 %%              is the 1-hour portion of cache_write.
-%%              An Anthropic assistant map may also include thinking => [Block].
+%%              An assistant map may also include thinking => [Block].
 %%              Those blocks are sent back unchanged on the next turn.
+%%              The field is left off when the model sent no thinking.
 %%   cost(Provider, Model, Usage) -> {ok, CostUsd} | {error, unknown_model}
 %%   cost(Provider, Model, Usage, Prices) -> same
 %% Each tool call = #{id => binary(), name => binary(), input => map()}
@@ -233,10 +234,7 @@ parse_anthropic(Resp) ->
                                            {<<>>, [], []}, Blocks),
     Usage = parse_anthropic_usage(Resp),
     Base = #{role => assistant, content => Text, tool_calls => Calls, usage => Usage},
-    case Thinking of
-        [] -> Base;
-        _  -> Base#{thinking => Thinking}
-    end.
+    put_thinking(Base, Thinking).
 
 fold_anthropic_block(Block, {TAcc, CAcc, ThinkAcc}) ->
     case maps:get(<<"type">>, Block, undefined) of
@@ -275,7 +273,8 @@ openai_chat(Size, Messages, Tools, Datasource, Opts) ->
 openai_responses_body(Model, InputItems, Tools, Datasource, Opts) ->
     Base0 = #{<<"model">> => to_bin(Model),
               <<"input">> => InputItems,
-              <<"max_output_tokens">> => ?MAX_TOKENS},
+              <<"max_output_tokens">> => ?MAX_TOKENS,
+              <<"include">> => [<<"reasoning.encrypted_content">>]},
     RequestTools = [openai_responses_tool(T) || T <- Tools]
                    ++ openai_datasource_tools(Datasource),
     Base1 = case RequestTools of
@@ -304,11 +303,12 @@ message_to_responses_input(#{role := user} = M) ->
 message_to_responses_input(#{role := assistant} = M) ->
     Text  = maps:get(content, M, <<>>),
     Calls = maps:get(tool_calls, M, []),
+    Thinking = [reasoning_input_item(B) || B <- maps:get(thinking, M, [])],
     Msgs = case Text of
                <<>> -> [];
                T    -> [assistant_text_input_item(T)]
            end,
-    Msgs ++ [function_call_input_item(TC) || TC <- Calls];
+    Thinking ++ Msgs ++ [function_call_input_item(TC) || TC <- Calls];
 message_to_responses_input(#{role := tool_result, tool_use_id := Id, content := C}) ->
     [#{<<"type">>   => <<"function_call_output">>,
        <<"call_id">> => to_bin(Id),
@@ -320,6 +320,14 @@ easy_input_message(Role, Content) when is_binary(Content); is_list(Content) ->
 assistant_text_input_item(Text) ->
     #{<<"role">> => <<"assistant">>,
       <<"content">> => [#{<<"type">> => <<"input_text">>, <<"text">> => to_bin(Text)}]}.
+
+reasoning_input_item(Block) ->
+    Kept = maps:with([<<"id">>, <<"summary">>, <<"content">>, <<"encrypted_content">>], Block),
+    Item = Kept#{<<"type">> => <<"reasoning">>},
+    case maps:is_key(<<"summary">>, Item) of
+        true -> Item;
+        false -> Item#{<<"summary">> => []}
+    end.
 
 %% Replay model tool calls without output-only fields (call_id is what function_call_output uses).
 function_call_input_item(#{id := CallId, name := Name, input := Input}) ->
@@ -349,24 +357,27 @@ responses_input_part({image_base64, Mime, B64}) ->
 
 parse_openai_response(Resp) ->
     Out = maps:get(<<"output">>, Resp, []),
-    {Text, Calls} = lists:foldl(fun fold_output_item/2, {<<>>, []}, Out),
+    {Text, Calls, Thinking} = lists:foldl(fun fold_output_item/2, {<<>>, [], []}, Out),
     Usage = parse_openai_responses_usage(Resp),
-    #{role => assistant, content => Text, tool_calls => Calls, usage => Usage}.
+    put_thinking(#{role => assistant, content => Text, tool_calls => Calls,
+                   usage => Usage}, Thinking).
 
-fold_output_item(Item, {TAcc, CAcc}) ->
+fold_output_item(Item, {TAcc, CAcc, ThinkAcc}) ->
     case maps:get(<<"type">>, Item, undefined) of
         <<"message">> ->
             T = extract_assistant_output_text(Item),
-            {<<TAcc/binary, T/binary>>, CAcc};
+            {<<TAcc/binary, T/binary>>, CAcc, ThinkAcc};
         <<"function_call">> ->
             CallId = maps:get(<<"call_id">>, Item),
             Name = maps:get(<<"name">>, Item),
             ArgsBin = maps:get(<<"arguments">>, Item, <<"{}">>),
             Input = json_util:decode(ArgsBin),
             Call = #{id => CallId, name => Name, input => Input},
-            {TAcc, CAcc ++ [Call]};
+            {TAcc, CAcc ++ [Call], ThinkAcc};
+        <<"reasoning">> ->
+            {TAcc, CAcc, ThinkAcc ++ [Item]};
         _ ->
-            {TAcc, CAcc}
+            {TAcc, CAcc, ThinkAcc}
     end.
 
 extract_assistant_output_text(Item) ->
@@ -471,9 +482,14 @@ openrouter_message(#{role := assistant} = M) ->
     Text = maps:get(content, M, <<>>),
     Calls = maps:get(tool_calls, M, []),
     Base = #{<<"role">> => <<"assistant">>, <<"content">> => to_bin(Text)},
-    case Calls of
-        [] -> Base;
-        _  -> Base#{<<"tool_calls">> => [openrouter_tool_call(TC) || TC <- Calls]}
+    Base1 = case Calls of
+                [] -> Base;
+                _  -> Base#{<<"tool_calls">> => [openrouter_tool_call(TC) || TC <- Calls]}
+            end,
+    case openrouter_thinking_replay(maps:get(thinking, M, [])) of
+        none -> Base1;
+        {reasoning, Reasoning} -> Base1#{<<"reasoning">> => Reasoning};
+        {details, Blocks} -> Base1#{<<"reasoning_details">> => Blocks}
     end;
 openrouter_message(#{role := Role, content := Content}) ->
     #{<<"role">> => atom_to_binary(Role), <<"content">> => to_bin(Content)}.
@@ -509,10 +525,11 @@ parse_openrouter_response(Resp) ->
                    end,
             Calls = [parse_openrouter_tool_call(TC)
                      || TC <- maps:get(<<"tool_calls">>, Message, [])],
-            {ok, #{role => assistant,
-                   content => Text,
-                   tool_calls => Calls,
-                   usage => parse_openrouter_usage(Resp)}};
+            {ok, put_thinking(#{role => assistant,
+                                content => Text,
+                                tool_calls => Calls,
+                                usage => parse_openrouter_usage(Resp)},
+                              openrouter_thinking(Message))};
         [] ->
             {error, {openrouter, empty_choices}};
         undefined ->
@@ -525,6 +542,43 @@ parse_openrouter_tool_call(TC) ->
     #{id => maps:get(<<"id">>, TC),
       name => maps:get(<<"name">>, Function),
       input => json_util:decode(Arguments)}.
+
+openrouter_thinking(Message) ->
+    case maps:get(<<"reasoning_details">>, Message, undefined) of
+        [_ | _] = Details ->
+            Details;
+        _ ->
+            case reasoning_text(Message) of
+                <<>> -> [];
+                Text -> [#{<<"type">> => <<"reasoning.text">>, <<"text">> => Text}]
+            end
+    end.
+
+reasoning_text(Message) ->
+    case maps:get(<<"reasoning">>, Message, maps:get(<<"reasoning_content">>, Message, <<>>)) of
+        null -> <<>>;
+        Text when is_binary(Text) -> Text;
+        Text when is_list(Text) -> to_bin(Text);
+        _ -> <<>>
+    end.
+
+openrouter_thinking_replay([]) ->
+    none;
+openrouter_thinking_replay(Blocks) ->
+    case lists:all(fun(B) -> maps:get(<<"type">>, B, undefined) =:= <<"reasoning.text">> end, Blocks) of
+        true ->
+            Text = lists:foldl(fun(B, Acc) ->
+                                   <<Acc/binary, (maps:get(<<"text">>, B, <<>>))/binary>>
+                               end, <<>>, Blocks),
+            {reasoning, Text};
+        false ->
+            {details, Blocks}
+    end.
+
+put_thinking(Resp, []) ->
+    Resp;
+put_thinking(Resp, Thinking) ->
+    Resp#{thinking => Thinking}.
 
 parse_openrouter_usage(Resp) ->
     case maps:get(<<"usage">>, Resp, null) of
