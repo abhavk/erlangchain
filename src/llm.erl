@@ -1,5 +1,6 @@
 -module(llm).
--export([chat/1, chat/3, chat/4, chat/5, chat/6, image/3, model_for/2]).
+-export([chat/1, chat/3, chat/4, chat/5, chat/6, image/3, model_for/2,
+         cost/3, cost/4]).
 -export_type([datasource/0]).
 
 -define(ANTHROPIC_URL, "https://api.anthropic.com/v1/messages").
@@ -38,17 +39,25 @@
 %% User multimodal: #{role => user, parts => [{text, _} | {image_base64, Mime, B64}]}
 %% Tools    = [#{name => binary(), description => binary(), parameters => map()}]
 %% Datasource = none | binary()  OpenAI vector store id; other providers do not support it.
-%% Opts     = #{model => string(), reasoning_effort => atom()}   optional overrides
+%% Opts     = #{model => string(), reasoning_effort => atom(),
+%%              pricing => boolean(), prices => map()}   optional overrides
 %%            reasoning_effort: OpenAI Responses (reasoning.effort) and OpenRouter
 %%            Chat Completions (reasoning.effort). Default for Provider=openai,
 %%            Size=big is medium; omit by overriding in Opts if needed.
+%%            pricing defaults to true. prices replaces llm_prices:list/0.
 %%
 %% OpenAI uses POST /v1/responses (not chat/completions); tools + reasoning use this API.
 %%
 %% Response = #{role => assistant, content => binary(), tool_calls => [...],
 %%              usage => #{in => integer(), out => integer(), cache_read => integer(),
-%%                         reasoning => integer()}}
-%%              reasoning: OpenAI Responses only; output-side reasoning_tokens (subset of out).
+%%                         reasoning => integer(), cost_usd => float()}}
+%%              reasoning: subset of out. OpenAI and OpenRouter report reasoning_tokens.
+%%              Anthropic reports output_tokens_details.thinking_tokens.
+%%              cost_usd is present when pricing is on and a rate is known.
+%%              An Anthropic assistant map may also include thinking => [Block].
+%%              Those blocks are sent back unchanged on the next turn.
+%%   cost(Provider, Model, Usage) -> {ok, CostUsd} | {error, unknown_model}
+%%   cost(Provider, Model, Usage, Prices) -> same
 %% Each tool call = #{id => binary(), name => binary(), input => map()}
 %% ImageResp = #{image => binary(), content_type => binary()}
 %%
@@ -101,6 +110,12 @@ image(Provider, Size, Prompt) when is_list(Provider); is_binary(Provider) ->
 image(opensource, large, Prompt) when is_list(Prompt); is_binary(Prompt) ->
     fal_image(Prompt).
 
+cost(Provider, Model, Usage) ->
+    llm_pricing:cost(Provider, Model, Usage).
+
+cost(Provider, Model, Usage, Prices) ->
+    llm_pricing:cost(Provider, Model, Usage, Prices).
+
 default_model(anthropic, big)   -> ?ANTHROPIC_BIG;
 default_model(anthropic, small) -> ?ANTHROPIC_SMALL;
 default_model(anthropic, frontier) -> ?ANTHROPIC_FRONTIER;
@@ -131,7 +146,7 @@ anthropic_chat(Size, Messages, Tools, Opts) ->
     Headers = [{"x-api-key", Key},
                {"anthropic-version", ?ANTHROPIC_VER}],
     case post(?ANTHROPIC_URL, Headers, Body) of
-        {ok, Resp} -> {ok, parse_anthropic(Resp)};
+        {ok, Resp} -> {ok, with_cost(anthropic, Model, Opts, parse_anthropic(Resp))};
         Err        -> Err
     end.
 
@@ -166,8 +181,9 @@ anthropic_msg(#{role := user, parts := Parts}) ->
 anthropic_msg(#{role := Role} = M) ->
     Text  = maps:get(content, M, <<>>),
     Calls = maps:get(tool_calls, M, []),
-    case Calls of
-        [] ->
+    Thinking = maps:get(thinking, M, []),
+    case {Thinking, Calls} of
+        {[], []} ->
             #{<<"role">> => atom_to_binary(Role), <<"content">> => to_bin(Text)};
         _ ->
             TextBlocks = case Text of
@@ -180,7 +196,7 @@ anthropic_msg(#{role := Role} = M) ->
                             <<"input">> => maps:get(input, TC)}
                           || TC <- Calls],
             #{<<"role">>    => atom_to_binary(Role),
-              <<"content">> => TextBlocks ++ ToolBlocks}
+              <<"content">> => Thinking ++ TextBlocks ++ ToolBlocks}
     end.
 
 anthropic_tool(#{name := N, description := D, parameters := P}) ->
@@ -190,20 +206,30 @@ anthropic_tool(#{name := N, description := D, parameters := P}) ->
 
 parse_anthropic(Resp) ->
     Blocks = maps:get(<<"content">>, Resp, []),
-    {Text, Calls} = lists:foldl(
-        fun(Block, {TAcc, CAcc}) ->
-            case maps:get(<<"type">>, Block) of
-                <<"text">> ->
-                    {<<TAcc/binary, (maps:get(<<"text">>, Block))/binary>>, CAcc};
-                <<"tool_use">> ->
-                    Call = #{id    => maps:get(<<"id">>, Block),
-                             name  => maps:get(<<"name">>, Block),
-                             input => maps:get(<<"input">>, Block)},
-                    {TAcc, CAcc ++ [Call]}
-            end
-        end, {<<>>, []}, Blocks),
+    {Text, Calls, Thinking} = lists:foldl(fun fold_anthropic_block/2,
+                                           {<<>>, [], []}, Blocks),
     Usage = parse_anthropic_usage(Resp),
-    #{role => assistant, content => Text, tool_calls => Calls, usage => Usage}.
+    Base = #{role => assistant, content => Text, tool_calls => Calls, usage => Usage},
+    case Thinking of
+        [] -> Base;
+        _  -> Base#{thinking => Thinking}
+    end.
+
+fold_anthropic_block(Block, {TAcc, CAcc, ThinkAcc}) ->
+    case maps:get(<<"type">>, Block, undefined) of
+        <<"text">> ->
+            {<<TAcc/binary, (maps:get(<<"text">>, Block, <<>>))/binary>>,
+             CAcc, ThinkAcc};
+        <<"tool_use">> ->
+            Call = #{id    => maps:get(<<"id">>, Block),
+                     name  => maps:get(<<"name">>, Block),
+                     input => maps:get(<<"input">>, Block, #{})},
+            {TAcc, CAcc ++ [Call], ThinkAcc};
+        Type when Type =:= <<"thinking">>; Type =:= <<"redacted_thinking">> ->
+            {TAcc, CAcc, ThinkAcc ++ [Block]};
+        _ ->
+            {TAcc, CAcc, ThinkAcc}
+    end.
 
 %%--- OpenAI ---------------------------------------------------------
 
@@ -219,7 +245,7 @@ openai_chat(Size, Messages, Tools, Datasource, Opts) ->
     Body = openai_responses_body(Model, InputItems, Tools, Datasource, Opts1),
     Headers = [{"authorization", "Bearer " ++ Key}],
     case post(?OPENAI_RESPONSES_URL, Headers, Body) of
-        {ok, Resp} -> {ok, parse_openai_response(Resp)};
+        {ok, Resp} -> {ok, with_cost(openai, Model, Opts1, parse_openai_response(Resp))};
         Err        -> Err
     end.
 
@@ -335,10 +361,18 @@ extract_assistant_output_text(Item) ->
 parse_anthropic_usage(Resp) ->
     case maps:get(<<"usage">>, Resp, null) of
         null -> #{in => 0, out => 0, cache_read => 0, reasoning => 0};
-        U    -> #{in         => maps:get(<<"input_tokens">>, U, 0),
-                  out        => maps:get(<<"output_tokens">>, U, 0),
-                  cache_read => maps:get(<<"cache_read_input_tokens">>, U, 0),
-                  reasoning  => 0}
+        U    ->
+            Details = maps:get(<<"output_tokens_details">>, U, #{}),
+            Thinking = case Details of
+                           Map when is_map(Map) ->
+                               maps:get(<<"thinking_tokens">>, Map, 0);
+                           _ ->
+                               0
+                       end,
+            #{in         => maps:get(<<"input_tokens">>, U, 0),
+              out        => maps:get(<<"output_tokens">>, U, 0),
+              cache_read => maps:get(<<"cache_read_input_tokens">>, U, 0),
+              reasoning  => Thinking}
     end.
 
 parse_openai_responses_usage(Resp) ->
@@ -368,8 +402,13 @@ openrouter_chat(Size, Messages, Tools, Opts) ->
     Body = openrouter_body(Model, Messages, Tools, Opts),
     Headers = [{"authorization", "Bearer " ++ Key}],
     case post(?OPENROUTER_CHAT_URL, Headers, Body) of
-        {ok, Resp} -> parse_openrouter_response(Resp);
-        Err        -> Err
+        {ok, Resp} ->
+            case parse_openrouter_response(Resp) of
+                {ok, Parsed} -> {ok, with_cost(opensource, Model, Opts, Parsed)};
+                Err -> Err
+            end;
+        Err ->
+            Err
     end.
 
 openrouter_body(Model, Messages, Tools, Opts) ->
@@ -460,10 +499,30 @@ parse_openrouter_usage(Resp) ->
         U ->
             PromptDetails = maps:get(<<"prompt_tokens_details">>, U, #{}),
             CompletionDetails = maps:get(<<"completion_tokens_details">>, U, #{}),
-            #{in => maps:get(<<"prompt_tokens">>, U, 0),
-              out => maps:get(<<"completion_tokens">>, U, 0),
-              cache_read => maps:get(<<"cached_tokens">>, PromptDetails, 0),
-              reasoning => maps:get(<<"reasoning_tokens">>, CompletionDetails, 0)}
+            Usage = #{in => maps:get(<<"prompt_tokens">>, U, 0),
+                      out => maps:get(<<"completion_tokens">>, U, 0),
+                      cache_read => maps:get(<<"cached_tokens">>, PromptDetails, 0),
+                      reasoning => maps:get(<<"reasoning_tokens">>, CompletionDetails, 0)},
+            case maps:get(<<"cost">>, U, undefined) of
+                Cost when is_number(Cost) -> Usage#{provider_cost => Cost};
+                _ -> Usage
+            end
+    end.
+
+with_cost(Provider, Model, Opts, #{usage := Usage} = Resp) ->
+    Resp#{usage => price_usage(Provider, Model, Usage, Opts)}.
+
+price_usage(Provider, Model, Usage, Opts) ->
+    Public = maps:remove(provider_cost, Usage),
+    case maps:get(pricing, Opts, true) of
+        false ->
+            Public;
+        _ ->
+            Prices = maps:get(prices, Opts, llm_prices:list()),
+            case llm_pricing:cost(Provider, Model, Usage, Prices) of
+                {ok, Cost} -> Public#{cost_usd => Cost};
+                {error, _} -> Public
+            end
     end.
 
 %%--- Hugging Face / fal-ai image generation ------------------------
