@@ -24,6 +24,10 @@ list() ->
           #{in => 2.00, out => 12.00, cache_read => 0.20},
       <<"gpt-5.6-sol">> =>
           #{in => 4.00, out => 20.00, cache_read => 0.40},
+      <<"gpt-6-astra">> =>
+          #{in => 10.00, out => 50.00, cache_read => 1.00,
+            long => #{after_tokens => 272000,
+                      in => 20.00, out => 75.00, cache_read => 2.00}},
       <<"claude-haiku-3-5-20241022">> =>
           #{in => 0.80, out => 4.00, cache_read => 0.08},
       <<"claude-sonnet-4-20250514">> =>

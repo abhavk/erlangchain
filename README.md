@@ -88,10 +88,10 @@ ok = llm_datasource:delete(openai, DatasourceId).
 
 `Messages` are maps like `#{role => system|user|assistant, content => binary()}`,
 plus `#{role => tool_result, tool_use_id => Id, content => Bin}` to return tool
-output. The `frontier` models are `gpt-5.6-sol` for OpenAI, `fable-5` for
+output. The `frontier` models are `gpt-6-astra` for OpenAI, `fable-5` for
 Anthropic, and `moonshotai/kimi-k3` for the `opensource` OpenRouter provider.
-Anthropic `big` is `claude-opus-5-5` and Anthropic `small` is
-`claude-haiku-5-5`. The other `opensource` defaults are `openai/gpt-oss-20b`
+OpenAI `big` is `gpt-5.6-sol`. Anthropic `big` is `claude-opus-5-5` and
+Anthropic `small` is `claude-haiku-5-5`. The other `opensource` defaults are `openai/gpt-oss-20b`
 for `small` and `z-ai/glm-5.2` for `big`. A tier can be replaced with an exact
 model slug as a string or binary; provider names also accept atoms, strings, or
 binaries.

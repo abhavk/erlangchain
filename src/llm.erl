@@ -16,9 +16,9 @@
 -define(ANTHROPIC_BIG,   "claude-opus-5-5").
 -define(ANTHROPIC_SMALL, "claude-haiku-5-5").
 -define(ANTHROPIC_FRONTIER, "fable-5").
--define(OPENAI_BIG,      "gpt-5.6-terra").
+-define(OPENAI_BIG,      "gpt-5.6-sol").
 -define(OPENAI_SMALL,    "gpt-5.6-luna").
--define(OPENAI_FRONTIER, "gpt-5.6-sol").
+-define(OPENAI_FRONTIER, "gpt-6-astra").
 -define(OPENSOURCE_BIG,  "z-ai/glm-5.2").
 -define(OPENSOURCE_SMALL,"openai/gpt-oss-20b").
 -define(OPENSOURCE_FRONTIER, "moonshotai/kimi-k3").
